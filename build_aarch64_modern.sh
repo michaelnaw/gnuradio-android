@@ -223,10 +223,20 @@ s0_assert_green_untouched
 ### spdlog (+ bundled fmt) — gr-runtime find_package(spdlog CONFIG)
 #############################################################
 if [ ! -f "${PREFIX}/lib/libspdlog.a" ]; then
+  # spdlog is pinned by the IMMUTABLE commit SHA, not the (movable) tag. The tag
+  # is only the fetch handle for a fast shallow clone; we then assert HEAD is the
+  # exact pinned commit and fail loudly if v1.12.0 was ever moved/retagged (this
+  # script has no `set -e`, so the check exits explicitly). SHA == tag v1.12.0.
   SPDLOG_TAG=v1.12.0
+  SPDLOG_SHA=7e635fca68d014934b4af8a1cf874f63989352b7
   cd ${BUILD_ROOT}
   [ -d spdlog ] || git clone --depth 1 --branch ${SPDLOG_TAG} https://github.com/gabime/spdlog.git
   cd spdlog
+  got_sha=$(git rev-parse HEAD)
+  if [ "${got_sha}" != "${SPDLOG_SHA}" ]; then
+    echo "FATAL: spdlog HEAD ${got_sha} != pinned ${SPDLOG_SHA} (tag ${SPDLOG_TAG} moved/retagged?)" >&2
+    exit 1
+  fi
   git clean -xdf
   mkdir -p build && cd build
   "${CMAKE_BIN}" "${CM_COMMON[@]}" \
