@@ -4,15 +4,6 @@
 [submodule "fftw3"]
 	path = fftw3
 	url = https://github.com/michaelnaw/fftw-dist.git
-[submodule "libzmq"]
-	path = libzmq
-	url = https://github.com/zeromq/libzmq.git
-[submodule "openssl"]
-	path = openssl
-	url = https://github.com/openssl/openssl.git
-[submodule "thrift"]
-	path = thrift
-	url = https://github.com/apache/thrift.git
 [submodule "volk"]
 	path = volk
 	url = https://github.com/gnuradio/volk.git
