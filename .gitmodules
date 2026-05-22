@@ -15,16 +15,16 @@
 	url = https://github.com/apache/thrift.git
 [submodule "volk"]
 	path = volk
-	url = https://github.com/bastibl/volk.git
+	url = https://github.com/gnuradio/volk.git
 [submodule "gnuradio"]
 	path = gnuradio
-	url = https://github.com/bastibl/gnuradio.git
+	url = https://github.com/michaelnaw/gnuradio.git
 [submodule "libgmp"]
 	path = libgmp
 	url = https://github.com/bastibl/libgmp.git
 [submodule "libusb"]
 	path = libusb
-	url = https://github.com/bastibl/libusb.git
+	url = https://github.com/libusb/libusb.git
 [submodule "hackrf"]
 	path = hackrf
 	url = https://github.com/bastibl/hackrf.git
@@ -36,7 +36,7 @@
 	url = https://github.com/bastibl/gr-grand.git
 [submodule "uhd"]
 	path = uhd
-	url = https://github.com/bastibl/uhd.git
+	url = https://github.com/michaelnaw/uhd.git
 [submodule "gr-clenabled"]
 	path = gr-clenabled
 	url = https://github.com/ghostop14/gr-clenabled.git
