@@ -1,31 +1,19 @@
 #!/bin/bash
-# build_aarch64_modern.sh — Phase-3 Layer-3 parallel modern toolchain build.
+# build_aarch64_modern.sh — cross-compile the modern GR + UHD toolchain for
+# arm64-v8a into toolchain/arm64-v8a-modern/. Run inside a container of
+# gnuradio-android:modern-r26 (Dockerfile.modern) with the repo root mounted.
+# Builds the pinned submodules: UHD 4.10, libusb 1.0.29, GNU Radio 3.10.12.0
+# (the uhd/gnuradio forks carry the fd-based USB init / UHD_IMAGES_DIR plus the
+# android_shm vmcircbuf + spdlog logcat-sink patches).
 #
-# S0: writes ONLY toolchain/arm64-v8a-modern/ (a NEW tree beside the
-# untouched arm64-v8a/). Run inside a container of gnuradio-android:modern-r26
-# (Dockerfile.modern) against THIS gnuradio-android `phase3` checkout — the
-# Layer-1/2 submodule pins: uhd e10d4516c (mainline 4.10.0.0 + P1-P9 fd
-# forward-port + P7 logcat + Decision-C UHD_IMAGES_DIR), libusb 15a7ebb
-# (upstream v1.0.29), gnuradio 51a6095a4 (mainline v3.10.12.0 + G1
-# vmcircbuf_android_shm + G4 spdlog android_sink). The canonical
-# build_aarch64.sh and toolchain/arm64-v8a/ are NOT touched.
+# Scope = the android-iqrec recorder dependency set only: CMakeLists.txt links
+# libgnuradio-{runtime,pmt,blocks,uhd} + libuhd. gr-ctrlport/thrift and the OOT
+# modules (osmosdr/grand/sched/ieee802) are intentionally OUT of scope — not in
+# the recorder's dependency set.
 #
-# Scope = the android-iqrec recorder dependency set ONLY (the Layer-3
-# acceptance artifact is the `prod` APK; CMakeLists.txt links exactly
-# libgnuradio-{runtime,pmt,blocks,uhd} + libuhd, plus -analog for the
-# selftest flavour). gr-ctrlport/thrift and the OOT modules
-# (osmosdr/grand/sched/ieee802 — WLAN demo, Layer 5) are intentionally
-# OUT of scope: not in the recorder's regression contract.
-#
-# Toolchain cascade (spike-proven, PHASE3_SPIKE_TIER1.md §S2): UHD 4.10 =>
-# Boost >=1.71 => NDK r26 (std::filesystem) => Boost-1.74 x clang-17 libc++
-# compat macros + patched Boost-for-Android + empty libpthread/librt stubs
-# (Bionic folds pthread into libc).
-#
-# NOTE: this is the Layer-3 first cut. GR-3.10 cross-build CMake option
-# drift (vs the GR-3.8 canonical build_aarch64.sh) is the expected
-# remaining work — converge it here in Stage B (the plan anticipates this:
-# "build-system churn"), one change per iteration.
+# Toolchain cascade: UHD 4.10 => Boost >= 1.71 => NDK r26 (std::filesystem) =>
+# Boost 1.74 x clang-17 libc++ compat macros + patched Boost-for-Android +
+# empty libpthread/librt stubs (Bionic folds pthread into libc).
 
 set -xeo pipefail
 
@@ -35,7 +23,7 @@ set -xeo pipefail
 export BUILD_ROOT=$(dirname $(readlink -f "$0"))
 export TOOLCHAIN_ROOT=${ANDROID_NDK_ROOT:?Dockerfile.modern must export ANDROID_NDK_ROOT}
 export HOST_ARCH=linux-x86_64
-export API_LEVEL=29                 # toolchain native API; SDK bump is Layer 4a
+export API_LEVEL=29                 # toolchain native API (SDK/app API set in Dockerfile.modern)
 export ANDROID_ABI=arm64-v8a
 export NCORES=$(getconf _NPROCESSORS_ONLN)
 
@@ -82,8 +70,8 @@ s0_assert_green_untouched() {
   set -x
 }
 
-# Boost-1.74 x clang-17 libc++ removed-feature compat (spike CMakeCache,
-# verbatim) — applied to every C++ component that includes Boost headers.
+# Boost-1.74 x clang-17 libc++ removed-feature compat macros — applied to
+# every C++ component that includes Boost headers.
 export LIBCXX_COMPAT="-D_LIBCPP_ENABLE_CXX17_REMOVED_FEATURES \
 -D_LIBCPP_ENABLE_CXX20_REMOVED_FEATURES \
 -D_LIBCPP_ENABLE_CXX17_REMOVED_UNARY_BINARY_FUNCTION \
@@ -146,8 +134,7 @@ fi
 # (b) common.jam: r26 dropped GNU-named ar/ranlib wrappers -> llvm-*; add
 # the libc++ removed-feature compat compileflags. The pattern contains
 # the literal token %ARCH% so sed (any delimiter) is unsafe — use a
-# Python str.replace pass, verbatim from the spike's proven fix_jam.py
-# (docs/phase3_spike_artifacts/boost_for_android_ndk19_jam_fix.py).
+# Python str.replace pass.
 JAM=configs/user-config-ndk19-1_74_0-common.jam
 [ -f ${JAM}.orig ] || cp ${JAM} ${JAM}.orig
 python3 - "$PWD/${JAM}" <<'PYJAM'
@@ -225,8 +212,8 @@ s0_assert_green_untouched
 if [ ! -f "${PREFIX}/lib/libspdlog.a" ]; then
   # spdlog is pinned by the IMMUTABLE commit SHA, not the (movable) tag. The tag
   # is only the fetch handle for a fast shallow clone; we then assert HEAD is the
-  # exact pinned commit and fail loudly if v1.12.0 was ever moved/retagged (this
-  # script has no `set -e`, so the check exits explicitly). SHA == tag v1.12.0.
+  # exact pinned commit and fail loudly if v1.12.0 was ever moved/retagged.
+  # SHA == tag v1.12.0.
   SPDLOG_TAG=v1.12.0
   SPDLOG_SHA=7e635fca68d014934b4af8a1cf874f63989352b7
   cd ${BUILD_ROOT}
@@ -250,7 +237,7 @@ else echo "spdlog: present — skipping"; fi
 s0_assert_green_untouched
 
 #############################################################
-### libusb 1.0.29  (pinned submodule; autotools cross-build, spike-proven)
+### libusb 1.0.29  (pinned submodule; autotools cross-build)
 #############################################################
 if [ ! -f "${PREFIX}/lib/libusb-1.0.so" ]; then
   cd ${BUILD_ROOT}/libusb
@@ -317,16 +304,14 @@ else echo "volk: present — skipping"; fi
 s0_assert_green_untouched
 
 #############################################################
-### UHD 4.10.0.0 + P1-P9 fd forward-port  (proven spike CMakeCache recipe)
+### UHD 4.10  (fd-based USB init fork; recorder dependency)
 #############################################################
 if [ ! -f "${PREFIX}/lib/libuhd.so" ]; then
   cd ${BUILD_ROOT}/uhd/host
   git clean -xdf
   mkdir -p build && cd build
-  # P7 (L1 commit 9c9433ba0) calls __android_log_print in log.cpp but
-  # did not add the liblog link dep to UHD's CMake — bridge with -llog
-  # here (NDK liblog is always present). Stage-D finding: fold -llog
-  # into the P7 UHD-CMake patch as an L1 hardening (sign-off).
+  # The UHD fork's log.cpp calls __android_log_print but its CMake doesn't add
+  # the liblog link dep — bridge with -llog here (NDK liblog is always present).
   "${CMAKE_BIN}" "${CM_COMMON[@]}" "${BOOST_CM[@]}" \
     -DCMAKE_SHARED_LINKER_FLAGS=-llog -DCMAKE_EXE_LINKER_FLAGS=-llog \
     -DCMAKE_CXX_FLAGS="${LIBCXX_COMPAT}" \
@@ -345,22 +330,21 @@ else echo "uhd: present — skipping"; fi
 s0_assert_green_untouched
 
 #############################################################
-### GNU Radio 3.10.12.0 + G1 (vmcircbuf_android_shm) + G4 (android_sink)
+### GNU Radio 3.10.12.0  (android_shm vmcircbuf + spdlog android_sink fork)
 ###   recorder set only: runtime/pmt/blocks/fft/uhd/analog
 #############################################################
 if [ ! -f "${PREFIX}/lib/libgnuradio-runtime.so" ]; then
   cd ${BUILD_ROOT}/gnuradio
   git clean -xdf
   mkdir -p build && cd build
-  # G4 (L2 commit 51a6095a4) adds a GR spdlog android_sink -> logcat;
-  # same -llog bridge as UHD P7 (Stage-D: fold into the G4 patch).
+  # The gnuradio fork adds a spdlog android_sink -> logcat; same -llog bridge
+  # as UHD above.
   # GR 3.10's common-precompiled-headers target links only spdlog (not
   # Boost::headers) but logger.h #includes <boost/format.hpp> -> PCH
   # compile fails. Inject Boost includes globally via -isystem so the
   # PCH (and every TU) sees them regardless of per-target wiring.
-  # G1 (vmcircbuf_android_shm.cc) calls ASharedMemory_create from
-  # libandroid (NDK API 26+) -> add -landroid to the link alongside
-  # -llog (P7/G4). Stage-D: fold into G1 patch's CMake.
+  # The fork's vmcircbuf_android_shm.cc calls ASharedMemory_create from
+  # libandroid (NDK API 26+) -> add -landroid to the link alongside -llog.
   "${CMAKE_BIN}" "${CM_COMMON[@]}" "${BOOST_CM[@]}" \
     -DCMAKE_SHARED_LINKER_FLAGS="-llog -landroid" \
     -DCMAKE_EXE_LINKER_FLAGS="-llog -landroid" \
