@@ -1,0 +1,124 @@
+# Dockerfile.modern — Phase-3 parallel modern toolchain image.
+#
+# Layer history:
+#   L3 (2026-05-19/20/21): NDK r26d + JDK split (JDK 11 default for
+#     AGP 3.6.3 / Gradle 5.6.4; JDK 17 inline-scoped for sdkmanager).
+#     SDK cmake pinned 3.18.1 (AGP 3.6.3 uses cmake server-mode
+#     protocol, removed in cmake 3.20+). API 33 / build-tools 30.0.3.
+#     Three AGP-3.6.3 toolchain bridges (cmake --version shim,
+#     GNU-named binutils symlinks, container path env) so the
+#     signed-off AGP 3.6.3 pin worked against NDK r26 + cmdline-
+#     tools 11076708 + cmake 3.22.1-g<sha>.
+#   L4a (sign-off 2026-05-21, see docs/PHASE3_LAYER4A_PLAN.md):
+#     JDK split COLLAPSED (AGP 8.7 requires JDK 17; JDK 11 retired).
+#     SDK cmake bumped 3.18.1 → 3.22.1 (AGP 8 has no server-mode
+#     restriction). API 33 → 35 / build-tools 30.0.3 → 35.0.0
+#     (compileSdk 35; targetSdk held at 28 per L4a Decision-1/A,
+#     bumped in L4b alongside scoped-storage rework). AGP-3.6.3
+#     bridges retired (cmake shim + binutils symlinks dropped —
+#     AGP 8 uses llvm-* names natively and parses cmake versions
+#     correctly).
+#
+# S0 (non-negotiable, unchanged): this is a SEPARATE image, built/run
+# under a SEPARATE tag (gnuradio-android:modern-r26). It NEVER
+# replaces or mutates drewbug/android-gnuradio:latest, and nothing
+# here writes the on-disk toolchain/arm64-v8a/ tree. This image only
+# provides the *environment*; the full .so set is cross-compiled by
+# build_aarch64_modern.sh (Layer-1/2 submodule pins: uhd e10d4516c,
+# libusb 15a7ebb v1.0.29, gnuradio 51a6095a4 v3.10.12.0+G1+G4) into
+# toolchain/arm64-v8a-modern/, kept beside the old arm64-v8a/ tree
+# for instant A/B.
+
+FROM ubuntu:26.04
+
+LABEL phase3.layer="3-and-4a" \
+      phase3.role="parallel-modern-toolchain" \
+      phase3.s0="separate image; never replaces drewbug/android-gnuradio:latest"
+
+ARG USER=android
+# r26d == SDK ndk package 26.3.11579264 (Decision-D target; spike-proven).
+ARG NDK_PKG_VERSION=26.3.11579264
+# Android SDK cmake: 3.22.1 (the cmdline-tools default for the current
+# release). AGP 8 has no server-mode dependency, so the prior pin to
+# 3.18.1 is retired. Still satisfies GR 3.10's >=3.16 requirement (the
+# modern .so set in toolchain/arm64-v8a-modern/ was already built
+# against 3.22.1 via the spike).
+ARG SDK_CMAKE_VERSION=3.22.1
+# L4a: compileSdk 35 + build-tools 35.0.0. minSdk/targetSdk stay at 28
+# in the iqrec app/build.gradle until L4b bumps targetSdk alongside the
+# scoped-storage rework.
+ARG ANDROID_API=35
+ARG ANDROID_BUILD_TOOLS=35.0.0
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Build + cross-build host tooling. Single JDK (17) — L4a collapsed the
+# Phase-1 JDK 11/17 split because AGP 8.7 requires JDK 17 to run, and
+# sdkmanager (2024 cmdline-tools, class-major-61) already required it.
+# Gradle 8.9 also wants JDK 17.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        ca-certificates curl git wget unzip zip sudo vim \
+        build-essential ninja-build pkg-config \
+        autoconf automake libtool m4 \
+        bison flex texinfo \
+        python3 python3-mako python3-numpy python3-setuptools \
+        swig \
+        openjdk-17-jdk-headless \
+    && rm -rf /var/lib/apt/lists/*
+
+# ubuntu:26.04 ships a default `ubuntu` user at UID/GID 1000 — remove it
+# so `android` can own 1000 (matches the host user, like the canonical
+# image; needed for bind-mounted source ownership).
+RUN userdel -r ubuntu 2>/dev/null || true \
+    && groupdel ubuntu 2>/dev/null || true \
+    && groupadd -g 1000 ${USER} \
+    && useradd -u 1000 -g 1000 --create-home ${USER} \
+    && echo "${USER} ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/90-${USER} \
+    && usermod -aG sudo ${USER}
+
+USER ${USER}
+WORKDIR /home/${USER}
+
+# JAVA_HOME = JDK 17. AGP 8.7 / Gradle 8.9 / Kotlin 2.0 / sdkmanager
+# all run on JDK 17; the inline-scoped invocation pattern from L3 is
+# no longer needed.
+ENV JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64
+ENV PATH=${JAVA_HOME}/bin:${PATH}
+
+ENV ANDROID_HOME=/home/${USER}/Android/Sdk
+ENV ANDROID_SDK_ROOT=${ANDROID_HOME}
+
+# Android SDK cmdline-tools (Jan-2024 build, JDK17). NDK r26d, platform
+# tools, the recorder's L4a compileSdk 35 / build-tools 35.0.0, and
+# cmake 3.22.1 all come from sdkmanager so AGP's externalNativeBuild
+# and the native cross-build share one NDK + one CMake.
+RUN mkdir -p ${ANDROID_HOME}/cmdline-tools \
+    && wget -q https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip -O /tmp/cmdtools.zip \
+    && unzip -q /tmp/cmdtools.zip -d ${ANDROID_HOME}/cmdline-tools \
+    && mv ${ANDROID_HOME}/cmdline-tools/cmdline-tools ${ANDROID_HOME}/cmdline-tools/latest \
+    && rm /tmp/cmdtools.zip
+
+ENV PATH=${ANDROID_HOME}/cmdline-tools/latest/bin:${ANDROID_HOME}/platform-tools:${PATH}
+
+RUN yes 2>/dev/null | sdkmanager --licenses >/dev/null 2>&1 || true \
+    && sdkmanager \
+        "platform-tools" \
+        "platforms;android-${ANDROID_API}" \
+        "build-tools;${ANDROID_BUILD_TOOLS}" \
+        "ndk;${NDK_PKG_VERSION}" \
+        "cmake;${SDK_CMAKE_VERSION}"
+
+ENV ANDROID_NDK_ROOT=${ANDROID_HOME}/ndk/${NDK_PKG_VERSION}
+ENV ANDROID_NDK_HOME=${ANDROID_NDK_ROOT}
+ENV ANDROID_SDK_CMAKE=${ANDROID_HOME}/cmake/${SDK_CMAKE_VERSION}/bin
+ENV PATH=${ANDROID_SDK_CMAKE}:${PATH}
+
+# L4a: the three AGP-3.6.3 bridges (cmake --version shim, GNU-named
+# binutils symlinks, JDK 11 default) are retired. AGP 8 uses llvm-*
+# names natively, parses cmake versions correctly (no "-g<sha>"
+# rejection), and requires JDK 17 — so the bridge code that L3 added
+# becomes unreachable. Removed in this commit; behaviour preserved
+# under AGP 8.7+ which is what L4a pins.
+
+WORKDIR /home/${USER}/src
+ENTRYPOINT ["/bin/bash"]
