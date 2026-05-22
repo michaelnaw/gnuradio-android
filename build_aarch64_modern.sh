@@ -1,0 +1,392 @@
+#!/bin/bash
+# build_aarch64_modern.sh — Phase-3 Layer-3 parallel modern toolchain build.
+#
+# S0: writes ONLY toolchain/arm64-v8a-modern/ (a NEW tree beside the
+# untouched arm64-v8a/). Run inside a container of gnuradio-android:modern-r26
+# (Dockerfile.modern) against THIS gnuradio-android `phase3` checkout — the
+# Layer-1/2 submodule pins: uhd e10d4516c (mainline 4.10.0.0 + P1-P9 fd
+# forward-port + P7 logcat + Decision-C UHD_IMAGES_DIR), libusb 15a7ebb
+# (upstream v1.0.29), gnuradio 51a6095a4 (mainline v3.10.12.0 + G1
+# vmcircbuf_android_shm + G4 spdlog android_sink). The canonical
+# build_aarch64.sh and toolchain/arm64-v8a/ are NOT touched.
+#
+# Scope = the android-iqrec recorder dependency set ONLY (the Layer-3
+# acceptance artifact is the `prod` APK; CMakeLists.txt links exactly
+# libgnuradio-{runtime,pmt,blocks,uhd} + libuhd, plus -analog for the
+# selftest flavour). gr-ctrlport/thrift and the OOT modules
+# (osmosdr/grand/sched/ieee802 — WLAN demo, Layer 5) are intentionally
+# OUT of scope: not in the recorder's regression contract.
+#
+# Toolchain cascade (spike-proven, PHASE3_SPIKE_TIER1.md §S2): UHD 4.10 =>
+# Boost >=1.71 => NDK r26 (std::filesystem) => Boost-1.74 x clang-17 libc++
+# compat macros + patched Boost-for-Android + empty libpthread/librt stubs
+# (Bionic folds pthread into libc).
+#
+# NOTE: this is the Layer-3 first cut. GR-3.10 cross-build CMake option
+# drift (vs the GR-3.8 canonical build_aarch64.sh) is the expected
+# remaining work — converge it here in Stage B (the plan anticipates this:
+# "build-system churn"), one change per iteration.
+
+set -xeo pipefail
+
+#############################################################
+### CONFIG
+#############################################################
+export BUILD_ROOT=$(dirname $(readlink -f "$0"))
+export TOOLCHAIN_ROOT=${ANDROID_NDK_ROOT:?Dockerfile.modern must export ANDROID_NDK_ROOT}
+export HOST_ARCH=linux-x86_64
+export API_LEVEL=29                 # toolchain native API; SDK bump is Layer 4a
+export ANDROID_ABI=arm64-v8a
+export NCORES=$(getconf _NPROCESSORS_ONLN)
+
+# SDK cmake 3.22.1 from Dockerfile.modern (NOT the distro cmake 4.x, which
+# rejects cmake_minimum_required < 3.5 used by UHD/Boost sub-projects).
+CMAKE_BIN="${ANDROID_SDK_CMAKE:?Dockerfile.modern must export ANDROID_SDK_CMAKE}/cmake"
+
+#############################################################
+### DERIVED CONFIG (NDK r26d clang toolchain)
+#############################################################
+export TOOLCHAIN_BIN=${TOOLCHAIN_ROOT}/toolchains/llvm/prebuilt/${HOST_ARCH}/bin
+export SYS_ROOT=${TOOLCHAIN_ROOT}/toolchains/llvm/prebuilt/${HOST_ARCH}/sysroot
+export CC="${TOOLCHAIN_BIN}/aarch64-linux-android${API_LEVEL}-clang"
+export CXX="${TOOLCHAIN_BIN}/aarch64-linux-android${API_LEVEL}-clang++"
+export AR=${TOOLCHAIN_BIN}/llvm-ar
+export RANLIB=${TOOLCHAIN_BIN}/llvm-ranlib
+export STRIP=${TOOLCHAIN_BIN}/llvm-strip
+export LD=${TOOLCHAIN_BIN}/ld
+export PATH=${TOOLCHAIN_BIN}:${ANDROID_SDK_CMAKE}:${PATH}
+
+export PREFIX=${BUILD_ROOT}/toolchain/${ANDROID_ABI}-modern
+export PKG_CONFIG_PATH=${PREFIX}/lib/pkgconfig
+mkdir -p ${PREFIX}/lib ${PREFIX}/include
+
+#############################################################
+### S0 GUARDRAIL — refuse to ever write the green arm64-v8a/ tree
+#############################################################
+GREEN_TREE=${BUILD_ROOT}/toolchain/${ANDROID_ABI}
+case "${PREFIX}" in
+  *-modern) : ;;
+  *) echo "S0 ABORT: PREFIX must be *-modern, got ${PREFIX}"; exit 99 ;;
+esac
+# Fingerprint the green tree (file list) so we can prove it was untouched.
+s0_snapshot() { find "${GREEN_TREE}" -mindepth 1 2>/dev/null | sort; }
+S0_BEFORE=$(s0_snapshot)
+s0_assert_green_untouched() {
+  { set +x; } 2>/dev/null    # silence set -x noise (snapshot is huge)
+  local now; now=$(s0_snapshot)
+  if [ "${now}" != "${S0_BEFORE}" ]; then
+    echo "S0 ABORT: green tree ${GREEN_TREE} changed during build:"
+    diff <(printf '%s\n' "${S0_BEFORE}") <(printf '%s\n' "${now}") | head
+    exit 98
+  fi
+  set -x
+}
+
+# Boost-1.74 x clang-17 libc++ removed-feature compat (spike CMakeCache,
+# verbatim) — applied to every C++ component that includes Boost headers.
+export LIBCXX_COMPAT="-D_LIBCPP_ENABLE_CXX17_REMOVED_FEATURES \
+-D_LIBCPP_ENABLE_CXX20_REMOVED_FEATURES \
+-D_LIBCPP_ENABLE_CXX17_REMOVED_UNARY_BINARY_FUNCTION \
+-Wno-enum-constexpr-conversion -Wno-deprecated-declarations \
+-Wno-deprecated-builtins"
+
+CM_COMMON=(
+  -G "Unix Makefiles"
+  -DCMAKE_TOOLCHAIN_FILE=${TOOLCHAIN_ROOT}/build/cmake/android.toolchain.cmake
+  -DANDROID_ABI=${ANDROID_ABI}
+  -DANDROID_ARM_NEON=ON
+  -DANDROID_PLATFORM=android-${API_LEVEL}
+  -DANDROID_STL=c++_shared
+  -DCMAKE_INSTALL_PREFIX=${PREFIX}
+  -DCMAKE_FIND_ROOT_PATH=${PREFIX}
+  -DCMAKE_PREFIX_PATH=${PREFIX}
+)
+
+#############################################################
+### Bionic stubs: empty libpthread.a / librt.a (pthread is in libc)
+#############################################################
+for stub in libpthread.a librt.a; do
+  if [ ! -f "${SYS_ROOT}/usr/lib/aarch64-linux-android/${stub}" ]; then
+    "${AR}" rcs "${SYS_ROOT}/usr/lib/aarch64-linux-android/${stub}" 2>/dev/null || \
+    "${AR}" rcs "${PREFIX}/lib/${stub}"
+  fi
+done
+
+#############################################################
+### BOOST 1.74 (patched Boost-for-Android: NDK-26 whitelist + jam)
+#############################################################
+cd ${BUILD_ROOT}/Boost-for-Android
+git clean -xdf
+# git clean does NOT revert tracked modifications — restore pristine so
+# the whitelist sed + jam python patch are reliably idempotent on rerun.
+git checkout -- build-android.sh ${PWD}/configs/user-config-ndk19-1_74_0-common.jam 2>/dev/null || \
+  git checkout -- build-android.sh configs/user-config-ndk19-1_74_0-common.jam
+rm -f configs/user-config-ndk19-1_74_0-common.jam.orig
+
+# (a0) Boost-for-Android's hardcoded boostorg.jfrog.io download URL was
+# sunset in 2024 (returns an HTML error, not the tarball). Repoint at the
+# official archive archives.boost.io (verified 200). Idempotent.
+sed -i 's%http://boostorg.jfrog.io/artifactory/main/release/%https://archives.boost.io/release/%' build-android.sh
+
+# (a0b) Offline-safe: if a pre-staged known-good tarball is mounted at
+# BOOST_TARBALL_CACHE, drop it in place so build-android.sh's
+# `[ ! -f $BOOST_TAR ]` skips the network entirely.
+BOOST_TARBALL_CACHE=${BOOST_TARBALL_CACHE:-/opt/boost-cache/boost_1_74_0.tar.bz2}
+if [ -s "${BOOST_TARBALL_CACHE}" ]; then
+  cp -f "${BOOST_TARBALL_CACHE}" boost_1_74_0.tar.bz2
+  echo "boost tarball: using cache ${BOOST_TARBALL_CACHE}"
+fi
+
+# (a) Accept NDK r26 ("26.3") on the clang/ndk19 config path + ARCHLIST.
+if ! grep -q '"26.0"|"26.1"|"26.2"|"26.3"' build-android.sh; then
+  sed -i 's/\t"19.0"|"19.1"|"19.2"|"20.0"|"20.1"|"21.0"|"21.1"|"21.2"|"21.3")/\t"19.0"|"19.1"|"19.2"|"20.0"|"20.1"|"21.0"|"21.1"|"21.2"|"21.3"|"22.0"|"22.1"|"23.0"|"23.1"|"23.2"|"24.0"|"25.0"|"25.1"|"25.2"|"26.0"|"26.1"|"26.2"|"26.3")/' build-android.sh
+  sed -i 's/      "17.1"|"17.2"|"18.0"|"18.1"|"19.0"|"19.1"|"19.2"|"20.0"|"20.1"|"21.0"|"21.1"|"21.2"|"21.3")/      "17.1"|"17.2"|"18.0"|"18.1"|"19.0"|"19.1"|"19.2"|"20.0"|"20.1"|"21.0"|"21.1"|"21.2"|"21.3"|"22.0"|"22.1"|"23.0"|"23.1"|"23.2"|"24.0"|"25.0"|"25.1"|"25.2"|"26.0"|"26.1"|"26.2"|"26.3")/' build-android.sh
+fi
+
+# (b) common.jam: r26 dropped GNU-named ar/ranlib wrappers -> llvm-*; add
+# the libc++ removed-feature compat compileflags. The pattern contains
+# the literal token %ARCH% so sed (any delimiter) is unsafe — use a
+# Python str.replace pass, verbatim from the spike's proven fix_jam.py
+# (docs/phase3_spike_artifacts/boost_for_android_ndk19_jam_fix.py).
+JAM=configs/user-config-ndk19-1_74_0-common.jam
+[ -f ${JAM}.orig ] || cp ${JAM} ${JAM}.orig
+python3 - "$PWD/${JAM}" <<'PYJAM'
+import sys
+p = sys.argv[1]
+s = open(p + ".orig").read()
+s = s.replace("<archiver>$(AndroidBinaryPrefix_%ARCH%)-ar",
+              "<archiver>$(AndroidBinariesPath)/llvm-ar")
+s = s.replace("<ranlib>$(AndroidBinaryPrefix_%ARCH%)-ranlib",
+              "<ranlib>$(AndroidBinariesPath)/llvm-ranlib")
+s = s.replace("<compileflags>-fexceptions\n",
+              "<compileflags>-fexceptions\n"
+              "<compileflags>-D_LIBCPP_ENABLE_CXX17_REMOVED_UNARY_BINARY_FUNCTION\n"
+              "<compileflags>-Wno-enum-constexpr-conversion\n")
+open(p, "w").write(s)
+print("jam patched OK")
+PYJAM
+
+# Boost-for-Android installs to <--prefix>/<--arch>. <--arch> MUST be a
+# recognised ABI (arm64-v8a) — it cannot be "arm64-v8a-modern" — so
+# pointing --prefix at toolchain/ would write the GREEN tree
+# (toolchain/arm64-v8a/). Instead stage into a dir OUTSIDE toolchain/,
+# then relocate the boost-1_74 include + libboost_* into PREFIX. Resumable:
+# skip the whole ~15-min Boost build if it is already in PREFIX.
+BOOST_STAGE=${BUILD_ROOT}/_boost_stage_modern   # NOT under toolchain/
+if [ ! -d "${PREFIX}/include/boost-1_74" ]; then
+  rm -rf "${BOOST_STAGE}"
+  mkdir -p "${BOOST_STAGE}"
+  # bootstrap builds the b2 engine with the HOST compiler and derives the
+  # NDK CXXPATH itself; our exported cross CC/CXX/AR/... must NOT leak in
+  # (else b2 is cross-built for aarch64 -> "Exec format error").
+  env -u CC -u CXX -u AR -u RANLIB -u STRIP -u LD -u CPPFLAGS -u LDFLAGS \
+    ./build-android.sh --boost=1.74.0 --toolchain=llvm \
+    --prefix="${BOOST_STAGE}" --arch=${ANDROID_ABI} \
+    --target-version=${API_LEVEL} ${TOOLCHAIN_ROOT}
+  cp -a "${BOOST_STAGE}/${ANDROID_ABI}/include/boost-1_74" "${PREFIX}/include/"
+  cp -a "${BOOST_STAGE}/${ANDROID_ABI}/lib/." "${PREFIX}/lib/"
+  rm -rf "${BOOST_STAGE}"
+else
+  echo "boost: ${PREFIX}/include/boost-1_74 present — skipping rebuild"
+fi
+s0_assert_green_untouched
+export BOOST_ROOT=${PREFIX}
+export BOOST_INCLUDEDIR=${PREFIX}/include/boost-1_74
+
+BOOST_CM=(
+  -DBOOST_ROOT=${PREFIX}
+  -DBoost_INCLUDE_DIR=${PREFIX}/include/boost-1_74
+  -DBoost_DEBUG=OFF -DBoost_COMPILER=-clang
+  -DBoost_USE_STATIC_LIBS=ON -DBoost_USE_DEBUG_LIBS=OFF
+  -DBoost_ARCHITECTURE=-a64
+)
+
+#############################################################
+### FFTW3  (single/float/neon, static) — gr-fft / gr-blocks
+#############################################################
+if [ ! -f "${PREFIX}/lib/libfftw3f.a" ]; then
+  cd ${BUILD_ROOT}/fftw3
+  git clean -xdf
+  # --with-pic so libfftw3f.a relocates into libgnuradio-fft.so on
+  # aarch64 (else: R_AARCH64_ADR_PREL_PG_HI21 cannot be used against
+  # symbol 'fftwf_dimcmp'; recompile with -fPIC).
+  ./configure --enable-single --enable-static --enable-threads \
+    --enable-float --enable-neon --disable-doc --with-pic \
+    --host=aarch64-linux-android --prefix=${PREFIX} \
+    CC="${CC}" AR="${AR}" RANLIB="${RANLIB}"
+  make -j ${NCORES}
+  make install
+else echo "fftw3: present — skipping"; fi
+s0_assert_green_untouched
+
+#############################################################
+### spdlog (+ bundled fmt) — gr-runtime find_package(spdlog CONFIG)
+#############################################################
+if [ ! -f "${PREFIX}/lib/libspdlog.a" ]; then
+  SPDLOG_TAG=v1.12.0
+  cd ${BUILD_ROOT}
+  [ -d spdlog ] || git clone --depth 1 --branch ${SPDLOG_TAG} https://github.com/gabime/spdlog.git
+  cd spdlog
+  git clean -xdf
+  mkdir -p build && cd build
+  "${CMAKE_BIN}" "${CM_COMMON[@]}" \
+    -DCMAKE_CXX_FLAGS="${LIBCXX_COMPAT}" \
+    -DSPDLOG_BUILD_SHARED=OFF -DSPDLOG_FMT_EXTERNAL=OFF \
+    -DSPDLOG_BUILD_EXAMPLE=OFF -DSPDLOG_BUILD_TESTS=OFF \
+    ../
+  make -j ${NCORES}
+  make install
+else echo "spdlog: present — skipping"; fi
+s0_assert_green_untouched
+
+#############################################################
+### libusb 1.0.29  (pinned submodule; autotools cross-build, spike-proven)
+#############################################################
+if [ ! -f "${PREFIX}/lib/libusb-1.0.so" ]; then
+  cd ${BUILD_ROOT}/libusb
+  git clean -xdf
+  ./bootstrap.sh
+  mkdir -p build-modern && cd build-modern
+  ../configure --host=aarch64-linux-android --prefix=${PREFIX} \
+    --enable-shared --disable-udev \
+    CC="${CC}" AR="${AR}" RANLIB="${RANLIB}"
+  make -j ${NCORES}
+  make install
+else echo "libusb: present — skipping"; fi
+s0_assert_green_untouched
+
+#############################################################
+### GMP — gnuradio-runtime MPLIB dep (GR_MPLIB_FOUND, hard for GR 3.10)
+#############################################################
+if [ ! -f "${PREFIX}/lib/libgmp.so" ] && [ ! -f "${PREFIX}/lib/libgmp.a" ]; then
+  cd ${BUILD_ROOT}/libgmp
+  git clean -xdf
+  ./.bootstrap
+  ./configure --enable-maintainer-mode --prefix=${PREFIX} \
+              --host=aarch64-linux-android --enable-cxx \
+              CC="${CC}" CXX="${CXX}" AR="${AR}" RANLIB="${RANLIB}"
+  make -j ${NCORES}
+  make install
+else echo "gmp: present — skipping"; fi
+s0_assert_green_untouched
+
+#############################################################
+### VOLK
+#############################################################
+if [ ! -e "${PREFIX}/include/volk/volk.h" ]; then
+  cd ${BUILD_ROOT}/volk
+  git clean -xdf
+  # GRAFT (toolchain, like the Boost-for-Android patches): old VOLK's
+  # build-time self-check `sys.version.split()[0] >= '3.4'` is a
+  # LEXICOGRAPHIC string compare — fails on Python >=3.10 (container is
+  # 3.14: '3.14.4' >= '3.4' is False). Repair to a numeric tuple compare.
+  # Idempotent: restore tracked source first.
+  git checkout -- CMakeLists.txt
+  python3 - CMakeLists.txt <<'PYVOLK'
+import sys
+p = sys.argv[1]
+s = open(p).read()
+s = s.replace("sys.version.split()[0] >= '3.4'",
+              "sys.version_info[:2] >= (3,4)")
+open(p, "w").write(s)
+print("volk python-check patched OK")
+PYVOLK
+  # Sanity echo only — VOLK >=2.5 already ships a correct version_info
+  # check (form varies: `sys.version_info[:2] >= (3,4)` vs
+  # `sys.version_info >= (3, 4)`); either is fine. Don't trip set -e.
+  grep -nE "sys\.version_info" CMakeLists.txt | head -1 || true
+  mkdir -p build && cd build
+  "${CMAKE_BIN}" "${CM_COMMON[@]}" "${BOOST_CM[@]}" \
+    -DCMAKE_CXX_FLAGS="${LIBCXX_COMPAT}" \
+    -DPYTHON_EXECUTABLE=/usr/bin/python3 \
+    -DENABLE_STATIC_LIBS=ON -DENABLE_MODTOOL=OFF -DENABLE_TESTING=OFF \
+    ../
+  make -j ${NCORES}
+  make install
+else echo "volk: present — skipping"; fi
+s0_assert_green_untouched
+
+#############################################################
+### UHD 4.10.0.0 + P1-P9 fd forward-port  (proven spike CMakeCache recipe)
+#############################################################
+if [ ! -f "${PREFIX}/lib/libuhd.so" ]; then
+  cd ${BUILD_ROOT}/uhd/host
+  git clean -xdf
+  mkdir -p build && cd build
+  # P7 (L1 commit 9c9433ba0) calls __android_log_print in log.cpp but
+  # did not add the liblog link dep to UHD's CMake — bridge with -llog
+  # here (NDK liblog is always present). Stage-D finding: fold -llog
+  # into the P7 UHD-CMake patch as an L1 hardening (sign-off).
+  "${CMAKE_BIN}" "${CM_COMMON[@]}" "${BOOST_CM[@]}" \
+    -DCMAKE_SHARED_LINKER_FLAGS=-llog -DCMAKE_EXE_LINKER_FLAGS=-llog \
+    -DCMAKE_CXX_FLAGS="${LIBCXX_COMPAT}" \
+    -DLIBUSB_INCLUDE_DIRS=${PREFIX}/include/libusb-1.0 \
+    -DLIBUSB_LIBRARIES=${PREFIX}/lib/libusb-1.0.so \
+    -DENABLE_STATIC_LIBS=OFF -DENABLE_EXAMPLES=OFF -DENABLE_TESTS=OFF \
+    -DENABLE_UTILS=OFF -DENABLE_PYTHON_API=OFF -DENABLE_MANUAL=OFF \
+    -DENABLE_DOXYGEN=OFF -DENABLE_MAN_PAGES=OFF -DENABLE_OCTOCLOCK=OFF \
+    -DENABLE_E300=OFF -DENABLE_E320=OFF -DENABLE_N300=OFF -DENABLE_N320=OFF \
+    -DENABLE_X300=OFF -DENABLE_USRP2=OFF -DENABLE_N230=OFF -DENABLE_MPMD=OFF \
+    -DENABLE_B100=OFF -DENABLE_USRP1=OFF -DENABLE_X400=OFF \
+    ../
+  make -j ${NCORES}
+  make install
+else echo "uhd: present — skipping"; fi
+s0_assert_green_untouched
+
+#############################################################
+### GNU Radio 3.10.12.0 + G1 (vmcircbuf_android_shm) + G4 (android_sink)
+###   recorder set only: runtime/pmt/blocks/fft/uhd/analog
+#############################################################
+if [ ! -f "${PREFIX}/lib/libgnuradio-runtime.so" ]; then
+  cd ${BUILD_ROOT}/gnuradio
+  git clean -xdf
+  mkdir -p build && cd build
+  # G4 (L2 commit 51a6095a4) adds a GR spdlog android_sink -> logcat;
+  # same -llog bridge as UHD P7 (Stage-D: fold into the G4 patch).
+  # GR 3.10's common-precompiled-headers target links only spdlog (not
+  # Boost::headers) but logger.h #includes <boost/format.hpp> -> PCH
+  # compile fails. Inject Boost includes globally via -isystem so the
+  # PCH (and every TU) sees them regardless of per-target wiring.
+  # G1 (vmcircbuf_android_shm.cc) calls ASharedMemory_create from
+  # libandroid (NDK API 26+) -> add -landroid to the link alongside
+  # -llog (P7/G4). Stage-D: fold into G1 patch's CMake.
+  "${CMAKE_BIN}" "${CM_COMMON[@]}" "${BOOST_CM[@]}" \
+    -DCMAKE_SHARED_LINKER_FLAGS="-llog -landroid" \
+    -DCMAKE_EXE_LINKER_FLAGS="-llog -landroid" \
+    -DCMAKE_CXX_FLAGS="${LIBCXX_COMPAT} -isystem ${PREFIX}/include/boost-1_74" \
+    -DPYTHON_EXECUTABLE=/usr/bin/python3 \
+    -DENABLE_INTERNAL_VOLK=OFF \
+    -Dspdlog_DIR=${PREFIX}/lib/cmake/spdlog \
+    -DENABLE_DOXYGEN=OFF -DENABLE_SPHINX=OFF -DENABLE_PYTHON=OFF \
+    -DENABLE_TESTING=OFF -DENABLE_GR_CTRLPORT=OFF \
+    -DENABLE_GNURADIO_RUNTIME=ON -DENABLE_GR_BLOCKS=ON -DENABLE_GR_FFT=ON \
+    -DENABLE_GR_UHD=ON -DENABLE_GR_ANALOG=ON -DENABLE_GR_FILTER=ON \
+    -DENABLE_GR_FEC=OFF -DENABLE_GR_AUDIO=OFF -DENABLE_GR_DTV=OFF \
+    -DENABLE_GR_CHANNELS=OFF -DENABLE_GR_VOCODER=OFF -DENABLE_GR_TRELLIS=OFF \
+    -DENABLE_GR_WAVELET=OFF -DENABLE_GR_DIGITAL=OFF -DENABLE_GR_NETWORK=OFF \
+    -DENABLE_GR_QTGUI=OFF -DENABLE_GR_ZEROMQ=OFF -DENABLE_GR_VIDEO_SDL=OFF \
+    -DENABLE_GR_PDU=OFF -DENABLE_GR_SOAPY=OFF \
+    ../
+  make -j ${NCORES}
+  make install
+else echo "gnuradio: present — skipping"; fi
+s0_assert_green_untouched
+
+#############################################################
+### jniLibs staging — PARALLEL jni-modern (NEVER touch the old jni/ which
+### symlinks into arm64-v8a/lib; that would break A/B + S0). The recorder's
+### `iqrecModern` build points jniLibs.srcDirs at toolchain/jni-modern.
+#############################################################
+# r26 ships libc++_shared.so in the NDK sysroot (no cxx-stl tree) — stage
+# it into the modern lib dir so a single jni-modern srcDir is sufficient.
+cp -f ${SYS_ROOT}/usr/lib/aarch64-linux-android/libc++_shared.so \
+      ${PREFIX}/lib/ 2>/dev/null || true
+mkdir -p ${BUILD_ROOT}/toolchain/jni-modern
+ln -sfn ../${ANDROID_ABI}-modern/lib \
+        ${BUILD_ROOT}/toolchain/jni-modern/${ANDROID_ABI}
+
+s0_assert_green_untouched
+echo "=== build_aarch64_modern.sh COMPLETE — toolchain/${ANDROID_ABI}-modern/ populated ==="
+ls -la ${PREFIX}/lib/libgnuradio-runtime.so ${PREFIX}/lib/libuhd.so \
+       ${PREFIX}/lib/libgnuradio-uhd.so 2>/dev/null || true
