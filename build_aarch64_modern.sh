@@ -70,6 +70,30 @@ s0_assert_green_untouched() {
   set -x
 }
 
+#############################################################
+### S0.5 PREFLIGHT — nested submodules must be populated
+#############################################################
+# A non-recursive clone leaves these dirs empty; without this guard the build
+# dies deep in the Boost step with a cryptic "pathspec did not match" (the
+# git checkout at line ~110 runs against an empty Boost-for-Android tree).
+# Fail early and actionably instead. See docs/LESSONS.md "clone --recursive".
+REQUIRED_SUBMODULES=(Boost-for-Android uhd gnuradio volk volk/cpu_features libusb fftw3 libgmp)
+PREFLIGHT_MISSING=()
+for sm in "${REQUIRED_SUBMODULES[@]}"; do
+  # an uninitialized submodule dir has no checked-out tree (empty)
+  if [ -z "$(ls -A "${BUILD_ROOT}/${sm}" 2>/dev/null)" ]; then
+    PREFLIGHT_MISSING+=("${sm}")
+  fi
+done
+if [ ${#PREFLIGHT_MISSING[@]} -ne 0 ]; then
+  { set +x; } 2>/dev/null
+  echo "PREFLIGHT ABORT: nested submodule(s) not populated: ${PREFLIGHT_MISSING[*]}"
+  echo "  Fix: from the meta-repo root, run"
+  echo "    git submodule update --init --recursive"
+  echo "  (or re-clone with 'git clone --recursive ...'). See docs/LESSONS.md."
+  exit 97
+fi
+
 # Boost-1.74 x clang-17 libc++ removed-feature compat macros — applied to
 # every C++ component that includes Boost headers.
 export LIBCXX_COMPAT="-D_LIBCPP_ENABLE_CXX17_REMOVED_FEATURES \
