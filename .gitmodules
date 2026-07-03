@@ -1,6 +1,7 @@
 [submodule "Boost-for-Android"]
 	path = Boost-for-Android
 	url = https://github.com/michaelnaw/Boost-for-Android.git
+	branch = b2xx-android
 [submodule "fftw3"]
 	path = fftw3
 	url = https://github.com/michaelnaw/fftw-dist.git

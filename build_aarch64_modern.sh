@@ -125,22 +125,25 @@ for stub in libpthread.a librt.a; do
 done
 
 #############################################################
-### BOOST 1.74 (patched Boost-for-Android: NDK-26 whitelist + jam)
+### BOOST 1.74 (Boost-for-Android fork @ b2xx-android: the download-URL,
+### NDK-26 whitelist, llvm-ar/ranlib and clang-17 jam patches are commits
+### in the submodule now, not build-time edits)
 #############################################################
 cd ${BUILD_ROOT}/Boost-for-Android
 git clean -xdf
-# git clean does NOT revert tracked modifications — restore pristine so
-# the whitelist sed + jam python patch are reliably idempotent on rerun.
-git checkout -- build-android.sh ${PWD}/configs/user-config-ndk19-1_74_0-common.jam 2>/dev/null || \
-  git checkout -- build-android.sh configs/user-config-ndk19-1_74_0-common.jam
-rm -f configs/user-config-ndk19-1_74_0-common.jam.orig
 
-# (a0) Boost-for-Android's hardcoded boostorg.jfrog.io download URL was
-# sunset in 2024 (returns an HTML error, not the tarball). Repoint at the
-# official archive archives.boost.io (verified 200). Idempotent.
-sed -i 's%http://boostorg.jfrog.io/artifactory/main/release/%https://archives.boost.io/release/%' build-android.sh
+# Fail fast if this checkout is an unpatched pin (pre-b2xx-android master,
+# or a bad bump): the patched markers must already be present.
+grep -q 'archives.boost.io' build-android.sh || {
+  echo "FATAL: Boost-for-Android lacks the b2xx-android patches (build-android.sh — wrong pin?)" >&2
+  exit 1
+}
+grep -q 'llvm-ranlib' configs/user-config-ndk19-1_74_0-common.jam || {
+  echo "FATAL: Boost-for-Android lacks the b2xx-android patches (common.jam — wrong pin?)" >&2
+  exit 1
+}
 
-# (a0b) Offline-safe: if a pre-staged known-good tarball is mounted at
+# Offline-safe: if a pre-staged known-good tarball is mounted at
 # BOOST_TARBALL_CACHE, drop it in place so build-android.sh's
 # `[ ! -f $BOOST_TAR ]` skips the network entirely.
 BOOST_TARBALL_CACHE=${BOOST_TARBALL_CACHE:-/opt/boost-cache/boost_1_74_0.tar.bz2}
@@ -148,34 +151,6 @@ if [ -s "${BOOST_TARBALL_CACHE}" ]; then
   cp -f "${BOOST_TARBALL_CACHE}" boost_1_74_0.tar.bz2
   echo "boost tarball: using cache ${BOOST_TARBALL_CACHE}"
 fi
-
-# (a) Accept NDK r26 ("26.3") on the clang/ndk19 config path + ARCHLIST.
-if ! grep -q '"26.0"|"26.1"|"26.2"|"26.3"' build-android.sh; then
-  sed -i 's/\t"19.0"|"19.1"|"19.2"|"20.0"|"20.1"|"21.0"|"21.1"|"21.2"|"21.3")/\t"19.0"|"19.1"|"19.2"|"20.0"|"20.1"|"21.0"|"21.1"|"21.2"|"21.3"|"22.0"|"22.1"|"23.0"|"23.1"|"23.2"|"24.0"|"25.0"|"25.1"|"25.2"|"26.0"|"26.1"|"26.2"|"26.3")/' build-android.sh
-  sed -i 's/      "17.1"|"17.2"|"18.0"|"18.1"|"19.0"|"19.1"|"19.2"|"20.0"|"20.1"|"21.0"|"21.1"|"21.2"|"21.3")/      "17.1"|"17.2"|"18.0"|"18.1"|"19.0"|"19.1"|"19.2"|"20.0"|"20.1"|"21.0"|"21.1"|"21.2"|"21.3"|"22.0"|"22.1"|"23.0"|"23.1"|"23.2"|"24.0"|"25.0"|"25.1"|"25.2"|"26.0"|"26.1"|"26.2"|"26.3")/' build-android.sh
-fi
-
-# (b) common.jam: r26 dropped GNU-named ar/ranlib wrappers -> llvm-*; add
-# the libc++ removed-feature compat compileflags. The pattern contains
-# the literal token %ARCH% so sed (any delimiter) is unsafe — use a
-# Python str.replace pass.
-JAM=configs/user-config-ndk19-1_74_0-common.jam
-[ -f ${JAM}.orig ] || cp ${JAM} ${JAM}.orig
-python3 - "$PWD/${JAM}" <<'PYJAM'
-import sys
-p = sys.argv[1]
-s = open(p + ".orig").read()
-s = s.replace("<archiver>$(AndroidBinaryPrefix_%ARCH%)-ar",
-              "<archiver>$(AndroidBinariesPath)/llvm-ar")
-s = s.replace("<ranlib>$(AndroidBinaryPrefix_%ARCH%)-ranlib",
-              "<ranlib>$(AndroidBinariesPath)/llvm-ranlib")
-s = s.replace("<compileflags>-fexceptions\n",
-              "<compileflags>-fexceptions\n"
-              "<compileflags>-D_LIBCPP_ENABLE_CXX17_REMOVED_UNARY_BINARY_FUNCTION\n"
-              "<compileflags>-Wno-enum-constexpr-conversion\n")
-open(p, "w").write(s)
-print("jam patched OK")
-PYJAM
 
 # Boost-for-Android installs to <--prefix>/<--arch>. <--arch> MUST be a
 # recognised ABI (arm64-v8a) — it cannot be "arm64-v8a-modern" — so
