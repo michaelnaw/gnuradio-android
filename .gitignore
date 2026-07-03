@@ -1,1 +1,4 @@
 toolchain
+# build byproducts: SHA-pinned build-time clone + staged UHD fw/FPGA images
+spdlog/
+uhd_images/
