@@ -143,6 +143,12 @@ grep -q 'llvm-ranlib' configs/user-config-ndk19-1_74_0-common.jam || {
   exit 1
 }
 
+# Boost 1.74.0 source tarball pin — sha256 of boost_1_74_0.tar.bz2 as
+# published at archives.boost.io/release/1.74.0/source/ (the URL
+# build-android.sh fetches). Asserted below before extraction, on both the
+# cache-hit and fresh-download paths.
+BOOST_SHA256=83bfc1507731a0906e387fc28b7ef5417d591429e51e788417fe9ff025e116b1
+
 # Offline-safe: if a pre-staged known-good tarball is mounted at
 # BOOST_TARBALL_CACHE, drop it in place so build-android.sh's
 # `[ ! -f $BOOST_TAR ]` skips the network entirely.
@@ -162,6 +168,20 @@ BOOST_STAGE=${BUILD_ROOT}/_boost_stage_modern   # NOT under toolchain/
 if [ ! -d "${PREFIX}/include/boost-1_74" ]; then
   rm -rf "${BOOST_STAGE}"
   mkdir -p "${BOOST_STAGE}"
+  # Integrity gate (same fail-fast pattern as the spdlog SHA assert below):
+  # make sure the exact tarball build-android.sh will extract is already
+  # present here — the cache copy above, else fetch the same URL the script
+  # would — then assert its sha256 against the pin BEFORE any extraction
+  # (`[ ! -f $BOOST_TAR ]` then skips build-android.sh's own download).
+  if [ ! -s boost_1_74_0.tar.bz2 ]; then
+    curl -fL --retry 3 -o boost_1_74_0.tar.bz2 \
+      "https://archives.boost.io/release/1.74.0/source/boost_1_74_0.tar.bz2"
+  fi
+  got_boost_sha=$(sha256sum boost_1_74_0.tar.bz2 | awk '{print $1}')
+  if [ "${got_boost_sha}" != "${BOOST_SHA256}" ]; then
+    echo "FATAL: boost_1_74_0.tar.bz2 sha256 ${got_boost_sha} != pinned ${BOOST_SHA256} (corrupt/tampered download or cache?)" >&2
+    exit 1
+  fi
   # bootstrap builds the b2 engine with the HOST compiler and derives the
   # NDK CXXPATH itself; our exported cross CC/CXX/AR/... must NOT leak in
   # (else b2 is cross-built for aarch64 -> "Exec format error").
